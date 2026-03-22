@@ -170,6 +170,21 @@ impl Broker {
         self.get_reservation_by_id(&id).await
     }
 
+    /// Update the state of a reservation.
+    pub async fn update_state(
+        &self,
+        reservation_id: &str,
+        new_state: ReservationState,
+    ) -> Result<(), PortError> {
+        sqlx::query("UPDATE reservations SET state = ? WHERE id = ?")
+            .bind(new_state.as_sql())
+            .bind(reservation_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| PortError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     /// Release a reservation by ID.
     pub async fn release_by_id(&mut self, reservation_id: &str) -> Result<(), PortError> {
         let reservation = self.get_reservation_by_id(reservation_id).await?;
@@ -270,6 +285,21 @@ impl Broker {
         .ok_or_else(|| PortError::ReservationNotFound(id.to_string()))?;
 
         Reservation::from_row(row).map_err(|e| PortError::Database(e.to_string()))
+    }
+
+    /// Release a hold listener for a given port (used when tunnel takes over the port).
+    pub fn release_hold_listener(&mut self, port: u16) {
+        self.hold_listeners.remove(&port);
+    }
+
+    /// Extract the VM name from an owner string like "vm:smith:web".
+    /// Returns None if the owner is not a VM reservation.
+    pub fn vm_name_from_owner(owner: &str) -> Option<&str> {
+        if owner.starts_with("vm:") {
+            owner.split(':').nth(1)
+        } else {
+            None
+        }
     }
 
     /// Get a single reservation by assigned port.

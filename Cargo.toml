@@ -25,4 +25,5 @@ russh-keys = "0.46"
 uuid = { version = "1", features = ["v4", "serde"] }
 tabled = "0.17"
 toml = "0.8"
+async-trait = "0.1"
 port-authority-core = { path = "crates/core" }

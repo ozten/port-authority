@@ -24,6 +24,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
+async-trait = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 async-stream = "0.3"

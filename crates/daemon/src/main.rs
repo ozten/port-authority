@@ -2,6 +2,8 @@ mod broker;
 mod config;
 mod db;
 mod grpc;
+mod lease;
+mod tunnel;
 
 use anyhow::Context;
 use std::path::Path;
@@ -25,13 +27,49 @@ async fn main() -> anyhow::Result<()> {
     // Initialize database
     let pool = db::init_pool(&config.daemon.db_path).await?;
 
+    // Load SSH config for VM tunneling
+    let ssh_config = config::Config::load_ssh_config().context("failed to load SSH config")?;
+
+    // Create tunnel manager
+    let tunnel_manager = tunnel::TunnelManager::new(ssh_config, config.tunnel);
+    let tunnel_manager = Arc::new(Mutex::new(tunnel_manager));
+
     // Create the broker
     let broker = broker::Broker::new(
-        pool,
+        pool.clone(),
         config.allocation.port_range_start,
         config.allocation.port_range_end,
     );
     let broker = Arc::new(Mutex::new(broker));
+
+    // Shutdown coordination
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Lease cleanup: expired reservations notify us so we can tear down tunnels
+    let (expired_tx, mut expired_rx) = tokio::sync::mpsc::unbounded_channel();
+    let lease_cleanup = lease::LeaseCleanup::new(pool, config.lease);
+    let lease_handle = tokio::spawn(lease_cleanup.run(expired_tx, shutdown_rx.clone()));
+
+    // Expired-reservation tunnel teardown task
+    let tunnel_mgr_for_expired = Arc::clone(&tunnel_manager);
+    let broker_for_expired = Arc::clone(&broker);
+    let expired_handle = tokio::spawn(async move {
+        while let Some(expired_list) = expired_rx.recv().await {
+            for expired in expired_list {
+                let mut tm = tunnel_mgr_for_expired.lock().await;
+                tm.stop_tunnel(&expired.id);
+                // Also free hold listener in broker
+                let mut b = broker_for_expired.lock().await;
+                b.release_hold_listener(expired.assigned_port);
+            }
+        }
+    });
+
+    // Health check background task
+    let tunnel_mgr_for_health = Arc::clone(&tunnel_manager);
+    let health_handle = tokio::spawn(tunnel::TunnelManager::run_health_checks(
+        tunnel_mgr_for_health,
+    ));
 
     // Ensure the socket parent directory exists with proper permissions
     let socket_path = &config.daemon.socket_path;
@@ -60,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
 
     // Start the gRPC server
-    let server = grpc::serve(uds, broker);
+    let server = grpc::serve(uds, broker.clone(), tunnel_manager.clone());
 
     // Wait for either the server to finish or a shutdown signal
     tokio::select! {
@@ -77,6 +115,12 @@ async fn main() -> anyhow::Result<()> {
             info!("received SIGTERM, shutting down");
         }
     }
+
+    // Signal shutdown to background tasks
+    let _ = shutdown_tx.send(true);
+    health_handle.abort();
+    expired_handle.abort();
+    let _ = lease_handle.await;
 
     // Cleanup: remove socket file
     if socket_path.exists() {

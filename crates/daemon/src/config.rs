@@ -49,6 +49,7 @@ pub struct TunnelConfig {
 #[derive(Debug, Deserialize)]
 pub struct LeaseConfig {
     #[serde(default)]
+    #[allow(dead_code)]
     pub default_lease_secs: u64,
     #[serde(default = "default_cleanup_interval")]
     pub cleanup_interval_secs: u64,

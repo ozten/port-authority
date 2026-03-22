@@ -1,9 +1,9 @@
 use crate::broker::{Broker, Reservation};
+use crate::tunnel::TunnelManager;
 use port_authority_core::proto::port_broker_server::{PortBroker, PortBrokerServer};
 use port_authority_core::proto::{
     InspectRequest, InspectResponse, ListRequest, ListResponse, ReleaseRequest, ReleaseResponse,
-    ReservationEvent, ReservationInfo, ReservationState as ProtoState, ReserveRequest,
-    ReserveResponse, TunnelHealth, WatchRequest,
+    ReservationEvent, ReservationInfo, ReserveRequest, ReserveResponse, TunnelHealth, WatchRequest,
 };
 use port_authority_core::types::ReservationState;
 use prost_types::Timestamp;
@@ -16,17 +16,20 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tonic::transport::server::Connected;
 use tonic::{Request, Response, Status};
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct PortBrokerService {
     broker: Arc<Mutex<Broker>>,
+    tunnel_manager: Arc<Mutex<TunnelManager>>,
+    #[allow(dead_code)]
     started_at: Instant,
 }
 
 impl PortBrokerService {
-    pub fn new(broker: Arc<Mutex<Broker>>) -> Self {
+    pub fn new(broker: Arc<Mutex<Broker>>, tunnel_manager: Arc<Mutex<TunnelManager>>) -> Self {
         Self {
             broker,
+            tunnel_manager,
             started_at: Instant::now(),
         }
     }
@@ -53,9 +56,6 @@ fn reservation_to_proto(r: &Reservation) -> ReservationInfo {
 
 /// Parse a SQLite datetime string like "2026-03-22 01:23:45" into a proto Timestamp.
 fn parse_sqlite_timestamp(s: &str) -> Option<Timestamp> {
-    // SQLite datetime format: "YYYY-MM-DD HH:MM:SS"
-    // We need to convert to Unix epoch seconds
-    // Simple parsing: use the fact that SQLite returns UTC
     let dt = chrono_parse_naive(s)?;
     Some(Timestamp {
         seconds: dt,
@@ -66,7 +66,6 @@ fn parse_sqlite_timestamp(s: &str) -> Option<Timestamp> {
 /// Minimal datetime parsing without chrono dependency.
 /// Parses "YYYY-MM-DD HH:MM:SS" to Unix timestamp.
 fn chrono_parse_naive(s: &str) -> Option<i64> {
-    // Split "2026-03-22 01:23:45" into date and time parts
     let parts: Vec<&str> = s.split(' ').collect();
     if parts.len() != 2 {
         return None;
@@ -90,7 +89,6 @@ fn chrono_parse_naive(s: &str) -> Option<i64> {
         time_parts[2] as i64,
     );
 
-    // Days from epoch (1970-01-01) — simplified calculation
     let mut days: i64 = 0;
     for y in 1970..year {
         days += if is_leap(y) { 366 } else { 365 };
@@ -132,14 +130,68 @@ impl PortBroker for PortBrokerService {
             .await
             .map_err(|e| tonic::Status::from(e))?;
 
-        let state = ReservationState::from_sql(&reservation.state)
+        // For VM reservations in pending state, start the SSH tunnel
+        let mut final_state = ReservationState::from_sql(&reservation.state)
             .map(|s| s.to_proto())
             .unwrap_or(0);
+
+        if let Some(vm_name) = Broker::vm_name_from_owner(&reservation.owner) {
+            if reservation.state == ReservationState::Pending.as_sql() {
+                let assigned_port = reservation.assigned_port as u16;
+                let target_host = reservation.target_host.clone();
+                let target_port = reservation.target_port as u16;
+                let reservation_id = reservation.id.clone();
+                let vm_name = vm_name.to_string();
+
+                // Release hold listener so the tunnel can bind the port
+                broker.release_hold_listener(assigned_port);
+
+                // Drop broker lock before SSH I/O
+                drop(broker);
+
+                let mut tm = self.tunnel_manager.lock().await;
+                match tm
+                    .start_tunnel(
+                        &reservation_id,
+                        &vm_name,
+                        assigned_port,
+                        &target_host,
+                        target_port,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        // Transition to active
+                        let broker = self.broker.lock().await;
+                        broker
+                            .update_state(&reservation_id, ReservationState::Active)
+                            .await
+                            .map_err(|e| tonic::Status::from(e))?;
+                        final_state = ReservationState::Active.to_proto();
+                        info!(id = %reservation_id, "VM tunnel started, reservation active");
+                    }
+                    Err(e) => {
+                        warn!(id = %reservation_id, error = %e, "tunnel start failed");
+                        let broker = self.broker.lock().await;
+                        let _ = broker
+                            .update_state(&reservation_id, ReservationState::Failed)
+                            .await;
+                        final_state = ReservationState::Failed.to_proto();
+                    }
+                }
+
+                return Ok(Response::new(ReserveResponse {
+                    reservation_id: reservation.id,
+                    assigned_port: reservation.assigned_port as u32,
+                    state: final_state,
+                }));
+            }
+        }
 
         Ok(Response::new(ReserveResponse {
             reservation_id: reservation.id,
             assigned_port: reservation.assigned_port as u32,
-            state,
+            state: final_state,
         }))
     }
 
@@ -150,15 +202,37 @@ impl PortBroker for PortBrokerService {
         let req = request.into_inner();
         let mut broker = self.broker.lock().await;
 
-        let result = match req.identifier {
+        // Get reservation info before releasing (for tunnel teardown)
+        let reservation = match &req.identifier {
             Some(port_authority_core::proto::release_request::Identifier::ReservationId(id)) => {
-                broker.release_by_id(&id).await
+                broker.get_reservation_by_id(id).await.ok()
             }
             Some(port_authority_core::proto::release_request::Identifier::Port(port)) => {
-                broker.release_by_port(port as u16).await
+                broker.get_reservation_by_port(*port as u16).await.ok()
             }
             None => return Err(Status::invalid_argument("specify reservation_id or port")),
         };
+
+        let result = match &req.identifier {
+            Some(port_authority_core::proto::release_request::Identifier::ReservationId(id)) => {
+                broker.release_by_id(id).await
+            }
+            Some(port_authority_core::proto::release_request::Identifier::Port(port)) => {
+                broker.release_by_port(*port as u16).await
+            }
+            None => unreachable!(),
+        };
+
+        // Drop broker lock before touching tunnel manager
+        drop(broker);
+
+        // Tear down any associated tunnel
+        if let Some(r) = reservation {
+            if Broker::vm_name_from_owner(&r.owner).is_some() {
+                let mut tm = self.tunnel_manager.lock().await;
+                tm.stop_tunnel(&r.id);
+            }
+        }
 
         match result {
             Ok(()) => Ok(Response::new(ReleaseResponse {
@@ -209,13 +283,43 @@ impl PortBroker for PortBrokerService {
 
         let info = reservation_to_proto(&reservation);
 
-        // Tunnel health — for host-side reservations, always report alive
         let is_host = reservation.owner.starts_with("host:");
-        let health = TunnelHealth {
-            alive: is_host || reservation.state == ReservationState::Active.as_sql(),
-            last_check: None,
-            uptime_seconds: 0,
-            reconnect_count: reservation.reconnect_count as u32,
+
+        // Get real tunnel health for VM reservations
+        let health = if is_host {
+            TunnelHealth {
+                alive: true,
+                last_check: None,
+                uptime_seconds: 0,
+                reconnect_count: 0,
+            }
+        } else {
+            // Drop broker lock before touching tunnel manager
+            drop(broker);
+            let tm = self.tunnel_manager.lock().await;
+            match tm.get_health(&reservation.id).await {
+                Some(h) => TunnelHealth {
+                    alive: h.alive,
+                    last_check: h.last_check.map(|_| {
+                        // Use current time as approximate last_check timestamp
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default();
+                        Timestamp {
+                            seconds: now.as_secs() as i64,
+                            nanos: 0,
+                        }
+                    }),
+                    uptime_seconds: h.started_at.elapsed().as_secs() as u32,
+                    reconnect_count: h.reconnect_count,
+                },
+                None => TunnelHealth {
+                    alive: reservation.state == ReservationState::Active.as_sql(),
+                    last_check: None,
+                    uptime_seconds: 0,
+                    reconnect_count: reservation.reconnect_count as u32,
+                },
+            }
         };
 
         Ok(Response::new(InspectResponse {
@@ -272,8 +376,12 @@ impl AsyncWrite for UnixStream {
 }
 
 /// Start the gRPC server on the given Unix listener.
-pub async fn serve(uds: UnixListener, broker: Arc<Mutex<Broker>>) -> anyhow::Result<()> {
-    let service = PortBrokerService::new(broker);
+pub async fn serve(
+    uds: UnixListener,
+    broker: Arc<Mutex<Broker>>,
+    tunnel_manager: Arc<Mutex<TunnelManager>>,
+) -> anyhow::Result<()> {
+    let service = PortBrokerService::new(broker, tunnel_manager);
 
     info!("gRPC server starting");
 
