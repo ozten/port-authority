@@ -6,6 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "Host-managed port brokerage for local VM development"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["macros", "rt", "net", "io-util", "signal", "sync", "time"] }
