@@ -1,10 +1,14 @@
+mod broker;
 mod config;
+mod db;
 mod grpc;
 
 use anyhow::Context;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::Mutex;
 use tracing::{error, info};
 
 #[tokio::main(flavor = "current_thread")]
@@ -17,6 +21,17 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     info!("portd starting");
+
+    // Initialize database
+    let pool = db::init_pool(&config.daemon.db_path).await?;
+
+    // Create the broker
+    let broker = broker::Broker::new(
+        pool,
+        config.allocation.port_range_start,
+        config.allocation.port_range_end,
+    );
+    let broker = Arc::new(Mutex::new(broker));
 
     // Ensure the socket parent directory exists with proper permissions
     let socket_path = &config.daemon.socket_path;
@@ -45,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
 
     // Start the gRPC server
-    let server = grpc::serve(uds);
+    let server = grpc::serve(uds, broker);
 
     // Wait for either the server to finish or a shutdown signal
     tokio::select! {
