@@ -1,0 +1,29 @@
+[package]
+name = "portd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "portd"
+path = "src/main.rs"
+
+[dependencies]
+port-authority-core = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+sqlx = { workspace = true }
+russh = { workspace = true }
+russh-keys = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+async-stream = "0.3"

@@ -1,0 +1,23 @@
+[package]
+name = "portctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "portctl"
+path = "src/main.rs"
+
+[dependencies]
+port-authority-core = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost-types = { workspace = true }
+clap = { workspace = true }
+tabled = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+tower = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }

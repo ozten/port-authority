@@ -1,0 +1,101 @@
+syntax = "proto3";
+package portd;
+
+import "google/protobuf/timestamp.proto";
+
+service PortBroker {
+    rpc Reserve(ReserveRequest) returns (ReserveResponse);
+    rpc Release(ReleaseRequest) returns (ReleaseResponse);
+    rpc List(ListRequest) returns (ListResponse);
+    rpc Inspect(InspectRequest) returns (InspectResponse);
+    rpc Watch(WatchRequest) returns (stream ReservationEvent);
+}
+
+enum ReservationState {
+    RESERVATION_STATE_UNSPECIFIED = 0;
+    RESERVATION_STATE_PENDING = 1;
+    RESERVATION_STATE_ACTIVE = 2;
+    RESERVATION_STATE_FAILED = 3;
+    RESERVATION_STATE_RELEASED = 4;
+}
+
+message ReserveRequest {
+    string owner = 1;
+    optional uint32 preferred_port = 2;
+    string target_host = 3;
+    uint32 target_port = 4;
+    optional uint32 lease_seconds = 5;
+    bool exact_only = 6;
+}
+
+message ReserveResponse {
+    string reservation_id = 1;
+    uint32 assigned_port = 2;
+    ReservationState state = 3;
+}
+
+message ReleaseRequest {
+    oneof identifier {
+        string reservation_id = 1;
+        uint32 port = 2;
+    }
+}
+
+message ReleaseResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message ListRequest {
+    optional string owner_filter = 1;
+    optional ReservationState state_filter = 2;
+}
+
+message ListResponse {
+    repeated ReservationInfo reservations = 1;
+}
+
+message InspectRequest {
+    oneof identifier {
+        string reservation_id = 1;
+        uint32 port = 2;
+    }
+}
+
+message InspectResponse {
+    ReservationInfo reservation = 1;
+    TunnelHealth tunnel_health = 2;
+}
+
+message ReservationInfo {
+    string id = 1;
+    string owner = 2;
+    uint32 requested_port = 3;
+    uint32 assigned_port = 4;
+    string target_host = 5;
+    uint32 target_port = 6;
+    ReservationState state = 7;
+    google.protobuf.Timestamp created_at = 8;
+    google.protobuf.Timestamp updated_at = 9;
+    optional uint32 lease_seconds = 10;
+    optional google.protobuf.Timestamp expires_at = 11;
+}
+
+message TunnelHealth {
+    bool alive = 1;
+    google.protobuf.Timestamp last_check = 2;
+    uint32 uptime_seconds = 3;
+    uint32 reconnect_count = 4;
+}
+
+message WatchRequest {
+    optional string owner_filter = 1;
+}
+
+message ReservationEvent {
+    string reservation_id = 1;
+    ReservationState old_state = 2;
+    ReservationState new_state = 3;
+    google.protobuf.Timestamp timestamp = 4;
+    optional string message = 5;
+}
