@@ -30,7 +30,7 @@ function getGrpc(): GrpcSingleton {
 	if (existing) return existing;
 
 	const socketPath = resolveSocketPath();
-	const address = `unix:${socketPath}`;
+	const address = `unix://${socketPath}`;
 
 	const channel = createChannel(address);
 	const singleton: GrpcSingleton = {
