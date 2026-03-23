@@ -48,10 +48,12 @@ struct TunnelParams {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal russh client handler -- accepts all host keys
+// SSH client handler with optional host-key verification
 // ---------------------------------------------------------------------------
 
-struct SshHandler;
+struct SshHandler {
+    expected_fingerprint: Option<String>,
+}
 
 #[async_trait]
 impl client::Handler for SshHandler {
@@ -59,10 +61,39 @@ impl client::Handler for SshHandler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &key::PublicKey,
+        server_public_key: &key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        // Local dev tunnelling -- always accept.
-        Ok(true)
+        let actual = server_public_key.fingerprint();
+
+        match &self.expected_fingerprint {
+            None => {
+                // No fingerprint configured -- accept all (local dev default).
+                warn!(
+                    fingerprint = %actual,
+                    "accepting SSH host key without verification \
+                     -- add host_key_fingerprint to ssh.toml to verify"
+                );
+                Ok(true)
+            }
+            Some(expected) => {
+                // Strip an optional "SHA256:" prefix so users can paste the
+                // output of `ssh-keygen -lf` directly.
+                let expected_bare = expected
+                    .strip_prefix("SHA256:")
+                    .unwrap_or(expected);
+
+                if actual == expected_bare {
+                    Ok(true)
+                } else {
+                    error!(
+                        expected = %expected,
+                        actual = %actual,
+                        "SSH host key fingerprint mismatch"
+                    );
+                    Ok(false)
+                }
+            }
+        }
     }
 }
 
@@ -349,8 +380,11 @@ async fn connect_and_authenticate(
     ));
     let config = Arc::new(config);
 
+    let handler = SshHandler {
+        expected_fingerprint: vm_ssh.host_key_fingerprint.clone(),
+    };
     let addr = (vm_ssh.host.as_str(), vm_ssh.port);
-    let mut handle = client::connect(config, addr, SshHandler)
+    let mut handle = client::connect(config, addr, handler)
         .await
         .map_err(|e| {
             PortError::SshConnectionFailed(vm_ssh.host.clone(), format!("connect: {e}"))

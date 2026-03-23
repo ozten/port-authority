@@ -68,18 +68,37 @@ fn escape_like(s: &str) -> String {
 pub struct Broker {
     pool: SqlitePool,
     port_range: (u16, u16),
+    max_per_owner: u32,
     /// Hold listeners for ports that are reserved but not yet tunneled.
     hold_listeners: HashMap<u16, StdTcpListener>,
     /// Broadcast channel for reservation state change events.
     event_tx: broadcast::Sender<BrokerEvent>,
 }
 
+/// Extract the owner prefix used for per-owner reservation counting.
+///
+/// For VM owners like "vm:smith:web", returns "vm:smith" (groups all services on that VM).
+/// For other owners like "host:web", returns the full string.
+fn owner_count_prefix(owner: &str) -> String {
+    if owner.starts_with("vm:") {
+        let parts: Vec<&str> = owner.splitn(3, ':').collect();
+        if parts.len() >= 2 {
+            format!("{}:{}", parts[0], parts[1])
+        } else {
+            owner.to_string()
+        }
+    } else {
+        owner.to_string()
+    }
+}
+
 impl Broker {
-    pub fn new(pool: SqlitePool, port_range_start: u16, port_range_end: u16) -> Self {
+    pub fn new(pool: SqlitePool, port_range_start: u16, port_range_end: u16, max_per_owner: u32) -> Self {
         let (event_tx, _) = broadcast::channel(256);
         Self {
             pool,
             port_range: (port_range_start, port_range_end),
+            max_per_owner,
             hold_listeners: HashMap::new(),
             event_tx,
         }
@@ -131,6 +150,21 @@ impl Broker {
             let r = Reservation::from_row(row).map_err(|e| PortError::Database(e.to_string()))?;
             debug!(id = %r.id, "returning existing reservation (idempotent)");
             return Ok(r);
+        }
+
+        // Enforce per-owner reservation limit
+        let prefix = owner_count_prefix(owner);
+        let like_pattern = format!("{}%", escape_like(&prefix));
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM reservations WHERE owner LIKE ? ESCAPE '\\' AND state != 'released'",
+        )
+        .bind(&like_pattern)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| PortError::Database(e.to_string()))?;
+
+        if count.0 as u32 >= self.max_per_owner {
+            return Err(PortError::OwnerLimitExceeded(prefix, self.max_per_owner));
         }
 
         // Allocate a port
@@ -465,6 +499,11 @@ impl Broker {
     fn can_bind(&self, port: u16) -> bool {
         StdTcpListener::bind(("127.0.0.1", port)).is_ok()
     }
+
+    #[cfg(test)]
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
 }
 
 #[cfg(test)]
@@ -493,7 +532,7 @@ mod tests {
             .await
             .unwrap();
 
-        let broker = Broker::new(pool, 10000, 60000);
+        let broker = Broker::new(pool, 10000, 60000, 100);
         (broker, dir)
     }
 
@@ -654,5 +693,217 @@ mod tests {
 
         let updated = broker.get_reservation_by_id(&r.id).await.unwrap();
         assert_eq!(updated.state, "active");
+    }
+
+    #[tokio::test]
+    async fn test_lease_expiration_cleanup() {
+        let (mut broker, _dir) = setup_broker().await;
+
+        let r = broker
+            .reserve("host:exp", Some(12348), "127.0.0.1", 8080, Some(1), true)
+            .await
+            .unwrap();
+        assert_eq!(r.state, "active");
+        assert!(r.expires_at.is_some());
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let pool = broker.pool();
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            "UPDATE reservations SET state = 'released' \
+             WHERE state IN ('active', 'pending') \
+             AND expires_at IS NOT NULL \
+             AND expires_at <= datetime('now') \
+             RETURNING id, assigned_port",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, r.id);
+        assert_eq!(rows[0].1, 12348);
+
+        let updated = broker.get_reservation_by_id(&r.id).await.unwrap();
+        assert_eq!(updated.state, "released");
+    }
+
+    #[tokio::test]
+    async fn test_reserve_after_lease_expiry() {
+        let (mut broker, _dir) = setup_broker().await;
+        let pool = broker.pool().clone();
+
+        let r1 = broker
+            .reserve("host:exp2", Some(12350), "127.0.0.1", 8080, Some(1), true)
+            .await
+            .unwrap();
+        assert_eq!(r1.assigned_port, 12350);
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            "UPDATE reservations SET state = 'released' \
+             WHERE state IN ('active', 'pending') \
+             AND expires_at IS NOT NULL \
+             AND expires_at <= datetime('now') \
+             RETURNING id, assigned_port",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // Release the hold listener so the port can be re-bound
+        broker.release_hold_listener(12350);
+
+        let r2 = broker
+            .reserve("host:exp2b", Some(12350), "127.0.0.1", 9090, None, true)
+            .await
+            .unwrap();
+        assert_eq!(r2.assigned_port, 12350);
+        assert_ne!(r2.id, r1.id);
+    }
+
+    #[tokio::test]
+    async fn test_purge_released_reservations() {
+        let (mut broker, _dir) = setup_broker().await;
+
+        let r = broker
+            .reserve("host:purge", Some(12351), "127.0.0.1", 8080, None, true)
+            .await
+            .unwrap();
+        broker.release_by_id(&r.id).await.unwrap();
+
+        let pool = broker.pool();
+
+        // Drop the auto-update trigger so we can backdate updated_at
+        sqlx::query("DROP TRIGGER IF EXISTS update_reservation_timestamp")
+            .execute(pool)
+            .await
+            .unwrap();
+
+        // Backdate the updated_at so the reservation appears old
+        sqlx::query("UPDATE reservations SET updated_at = datetime('now', '-2 days') WHERE id = ?")
+            .bind(&r.id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        // Purge released reservations older than 1 day (86400 seconds)
+        let result = sqlx::query(
+            "DELETE FROM reservations WHERE state = 'released' \
+             AND updated_at <= datetime('now', '-86400 seconds')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        assert_eq!(result.rows_affected(), 1);
+
+        // The reservation should no longer exist
+        let gone = broker.get_reservation_by_id(&r.id).await;
+        assert!(gone.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_event_broadcast() {
+        let (mut broker, _dir) = setup_broker().await;
+        let mut rx = broker.subscribe();
+
+        let r = broker
+            .reserve("host:evt", Some(12352), "127.0.0.1", 8080, None, true)
+            .await
+            .unwrap();
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.reservation_id, r.id);
+        assert_eq!(event.new_state, "active");
+        assert_eq!(event.old_state, "unspecified");
+
+        broker.release_by_id(&r.id).await.unwrap();
+
+        let event2 = rx.try_recv().unwrap();
+        assert_eq!(event2.reservation_id, r.id);
+        assert_eq!(event2.new_state, "released");
+        assert_eq!(event2.old_state, "active");
+    }
+
+    #[tokio::test]
+    async fn test_event_broadcast_on_update_state() {
+        let (mut broker, _dir) = setup_broker().await;
+
+        let r = broker
+            .reserve("vm:evt2:web", Some(12353), "127.0.0.1", 8080, None, true)
+            .await
+            .unwrap();
+        assert_eq!(r.state, "pending");
+
+        let mut rx = broker.subscribe();
+
+        broker
+            .update_state(&r.id, ReservationState::Active)
+            .await
+            .unwrap();
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.reservation_id, r.id);
+        assert_eq!(event.old_state, "pending");
+        assert_eq!(event.new_state, "active");
+    }
+
+    #[tokio::test]
+    async fn test_release_idempotent() {
+        let (mut broker, _dir) = setup_broker().await;
+
+        let r = broker
+            .reserve("host:idem", Some(12354), "127.0.0.1", 8080, None, true)
+            .await
+            .unwrap();
+
+        broker.release_by_id(&r.id).await.unwrap();
+        // Second release should be a no-op, not an error
+        broker.release_by_id(&r.id).await.unwrap();
+
+        let released = broker.get_reservation_by_id(&r.id).await.unwrap();
+        assert_eq!(released.state, "released");
+    }
+
+    #[tokio::test]
+    async fn test_delete_clears_released_on_reuse() {
+        let (mut broker, _dir) = setup_broker().await;
+        let pool = broker.pool().clone();
+
+        let r1 = broker
+            .reserve("host:del1", Some(12349), "127.0.0.1", 8080, None, true)
+            .await
+            .unwrap();
+        assert_eq!(r1.assigned_port, 12349);
+
+        broker.release_by_id(&r1.id).await.unwrap();
+
+        // Verify the released row still exists
+        let released_row: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM reservations WHERE id = ? AND state = 'released'")
+                .bind(&r1.id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(released_row.is_some());
+
+        // Reserve the same port with a different owner
+        let r2 = broker
+            .reserve("host:del2", Some(12349), "127.0.0.1", 9090, None, true)
+            .await
+            .unwrap();
+        assert_eq!(r2.assigned_port, 12349);
+        assert_ne!(r2.id, r1.id);
+
+        // The old released row should be gone (deleted by reserve's transaction)
+        let old_row: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM reservations WHERE id = ?")
+                .bind(&r1.id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(old_row.is_none());
     }
 }

@@ -1,7 +1,7 @@
 mod output;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use hyper_util::rt::TokioIo;
 use port_authority_core::proto::port_broker_client::PortBrokerClient;
 use port_authority_core::proto::{
@@ -90,6 +90,13 @@ enum Commands {
 
     /// Show daemon health and statistics
     Status,
+
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 fn default_socket_path() -> String {
@@ -105,6 +112,13 @@ fn default_socket_path() -> String {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // Handle completions before connecting to daemon
+    if let Commands::Completions { shell } = &cli.command {
+        let mut cmd = Cli::command();
+        clap_complete::generate(*shell, &mut cmd, "portctl", &mut std::io::stdout());
+        return Ok(());
+    }
 
     let channel = connect_to_daemon(&cli.socket).await?;
     let mut client = PortBrokerClient::new(channel);
@@ -230,6 +244,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+
+        Commands::Completions { .. } => unreachable!("handled above"),
 
         Commands::Status => {
             // Use list as a health check — if we can connect and get a response, daemon is up

@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
         pool.clone(),
         config.allocation.port_range_start,
         config.allocation.port_range_end,
+        config.allocation.max_reservations_per_owner,
     );
     let broker = Arc::new(Mutex::new(broker));
 

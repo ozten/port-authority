@@ -30,6 +30,8 @@ pub struct AllocationConfig {
     pub port_range_start: u16,
     #[serde(default = "default_port_range_end")]
     pub port_range_end: u16,
+    #[serde(default = "default_max_reservations_per_owner")]
+    pub max_reservations_per_owner: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +73,11 @@ pub struct VmSshConfig {
     pub port: u16,
     pub user: String,
     pub key: PathBuf,
+    /// Optional SSH host key fingerprint (SHA-256 base64, e.g.
+    /// `"SHA256:abcdef..."` or just the base64 digest). When set, the daemon
+    /// verifies the remote host key against this value. When absent, all host
+    /// keys are accepted (suitable for trusted local VMs).
+    pub host_key_fingerprint: Option<String>,
 }
 
 // Defaults
@@ -101,6 +108,10 @@ fn default_port_range_start() -> u16 {
 
 fn default_port_range_end() -> u16 {
     60000
+}
+
+fn default_max_reservations_per_owner() -> u32 {
+    100
 }
 
 fn default_health_check_interval() -> u64 {
@@ -160,6 +171,7 @@ impl Default for AllocationConfig {
         Self {
             port_range_start: default_port_range_start(),
             port_range_end: default_port_range_end(),
+            max_reservations_per_owner: default_max_reservations_per_owner(),
         }
     }
 }

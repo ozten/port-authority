@@ -20,6 +20,9 @@ pub enum PortError {
     #[error("SSH connection to {0} failed: {1}")]
     SshConnectionFailed(String, String),
 
+    #[error("owner {0} has reached the maximum reservation limit ({1})")]
+    OwnerLimitExceeded(String, u32),
+
     #[error("database error: {0}")]
     Database(String),
 
@@ -34,6 +37,7 @@ impl From<PortError> for tonic::Status {
                 tonic::Status::already_exists(e.to_string())
             }
             PortError::PortRangeExhausted(..) => tonic::Status::resource_exhausted(e.to_string()),
+            PortError::OwnerLimitExceeded(..) => tonic::Status::resource_exhausted(e.to_string()),
             PortError::ReservationNotFound(_) => tonic::Status::not_found(e.to_string()),
             PortError::VmNotConfigured(_) => tonic::Status::failed_precondition(e.to_string()),
             PortError::SshConnectionFailed(..) => tonic::Status::unavailable(e.to_string()),
