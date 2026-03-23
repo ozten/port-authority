@@ -26,6 +26,7 @@ message ReserveRequest {
     uint32 target_port = 4;
     optional uint32 lease_seconds = 5;
     bool exact_only = 6;
+    optional uint32 start_port = 7;
 }
 
 message ReserveResponse {

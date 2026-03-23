@@ -151,6 +151,11 @@ impl PortBroker for PortBrokerService {
                 return Err(Status::invalid_argument("preferred_port must be 1-65535"));
             }
         }
+        if let Some(port) = req.start_port {
+            if port == 0 || port > 65535 {
+                return Err(Status::invalid_argument("start_port must be 1-65535"));
+            }
+        }
 
         let mut broker = self.broker.lock().await;
 
@@ -162,6 +167,7 @@ impl PortBroker for PortBrokerService {
                 req.target_port as u16,
                 req.lease_seconds,
                 req.exact_only,
+                req.start_port.map(|p| p as u16),
             )
             .await
             .map_err(|e| tonic::Status::from(e))?;

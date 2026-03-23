@@ -50,6 +50,10 @@ enum Commands {
         /// Lease duration in seconds (0 = indefinite)
         #[arg(short, long)]
         lease: Option<u32>,
+
+        /// Scan for first available port starting from this number
+        #[arg(long)]
+        start_port: Option<u32>,
     },
 
     /// Release a port reservation
@@ -120,6 +124,15 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // PORTD_HOST env var enables topology-transparent operation.
+    // If set to ssh://user@host, portctl re-executes itself on the remote host via SSH.
+    if let Ok(host_url) = std::env::var("PORTD_HOST") {
+        if let Some(ssh_target) = host_url.strip_prefix("ssh://") {
+            return exec_via_ssh(ssh_target, &cli).await;
+        }
+        // Future: tcp:// support would connect directly via gRPC/TCP
+    }
+
     let channel = connect_to_daemon(&cli.socket).await?;
     let mut client = PortBrokerClient::new(channel);
 
@@ -130,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
             port,
             exact,
             lease,
+            start_port,
         } => {
             let (target_host, target_port) = parse_target(&target)?;
             let response = client
@@ -140,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
                     target_port,
                     lease_seconds: lease,
                     exact_only: exact,
+                    start_port,
                 })
                 .await
                 .context("reserve failed")?;
@@ -269,6 +284,99 @@ async fn main() -> anyhow::Result<()> {
                 println!("Active reservations: {}", resp.reservations.len());
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Re-execute the portctl command on a remote host via SSH.
+///
+/// This enables topology-transparent operation: a process in a VM can set
+/// `PORTD_HOST=ssh://user@host` and all portctl commands will be forwarded
+/// to the host where portd is actually running.
+async fn exec_via_ssh(ssh_target: &str, cli: &Cli) -> anyhow::Result<()> {
+    // Rebuild the portctl command-line args (without the binary name)
+    let mut args = Vec::new();
+    if cli.json {
+        args.push("--json".to_string());
+    }
+    match &cli.command {
+        Commands::Reserve {
+            owner,
+            target,
+            port,
+            exact,
+            lease,
+            start_port,
+        } => {
+            args.push("reserve".to_string());
+            args.extend(["--owner".to_string(), owner.clone()]);
+            args.extend(["--target".to_string(), target.clone()]);
+            if let Some(p) = port {
+                args.extend(["--port".to_string(), p.to_string()]);
+            }
+            if *exact {
+                args.push("--exact".to_string());
+            }
+            if let Some(l) = lease {
+                args.extend(["--lease".to_string(), l.to_string()]);
+            }
+            if let Some(sp) = start_port {
+                args.extend(["--start-port".to_string(), sp.to_string()]);
+            }
+        }
+        Commands::Release { port, id } => {
+            args.push("release".to_string());
+            if let Some(p) = port {
+                args.extend(["--port".to_string(), p.to_string()]);
+            }
+            if let Some(i) = id {
+                args.extend(["--id".to_string(), i.clone()]);
+            }
+        }
+        Commands::List { owner } => {
+            args.push("list".to_string());
+            if let Some(o) = owner {
+                args.extend(["--owner".to_string(), o.clone()]);
+            }
+        }
+        Commands::Inspect { port, id } => {
+            args.push("inspect".to_string());
+            if let Some(p) = port {
+                args.extend(["--port".to_string(), p.to_string()]);
+            }
+            if let Some(i) = id {
+                args.extend(["--id".to_string(), i.clone()]);
+            }
+        }
+        Commands::Watch { owner } => {
+            args.push("watch".to_string());
+            if let Some(o) = owner {
+                args.extend(["--owner".to_string(), o.clone()]);
+            }
+        }
+        Commands::Status => {
+            args.push("status".to_string());
+        }
+        Commands::Completions { .. } => {
+            anyhow::bail!("completions cannot be generated over SSH");
+        }
+    }
+
+    // Build SSH command: ssh <target> portctl <args...>
+    let mut ssh_args = vec![ssh_target.to_string(), "portctl".to_string()];
+    ssh_args.extend(args);
+
+    let status = std::process::Command::new("ssh")
+        .args(&ssh_args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .context("failed to execute ssh")?;
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
     }
 
     Ok(())

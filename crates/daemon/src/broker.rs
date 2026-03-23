@@ -133,6 +133,7 @@ impl Broker {
         target_port: u16,
         lease_seconds: Option<u32>,
         exact_only: bool,
+        start_port: Option<u16>,
     ) -> Result<Reservation, PortError> {
         // Check for duplicate: same owner + same target
         let existing = sqlx::query(&format!(
@@ -168,7 +169,7 @@ impl Broker {
         }
 
         // Allocate a port
-        let port = self.allocate_port(preferred_port, exact_only).await?;
+        let port = self.allocate_port(preferred_port, exact_only, start_port).await?;
 
         // Bind-and-hold: bind the port immediately to prevent TOCTOU races
         let listener = StdTcpListener::bind(("127.0.0.1", port)).map_err(|_| {
@@ -433,31 +434,26 @@ impl Broker {
         Reservation::from_row(row).map_err(|e| PortError::Database(e.to_string()))
     }
 
-    /// Allocate a port based on preference and availability.
+    /// Allocate a port based on preference, start_port offset, and availability.
+    ///
+    /// Priority: preferred_port (exact match) > scan from start_port or preferred_port > scan from range start.
     async fn allocate_port(
         &self,
         preferred: Option<u16>,
         exact_only: bool,
+        start_port: Option<u16>,
     ) -> Result<u16, PortError> {
-        let (start, end) = self.port_range;
+        let (range_start, range_end) = self.port_range;
 
-        // Get all currently assigned ports
-        let rows: Vec<(i64,)> =
-            sqlx::query_as("SELECT assigned_port FROM reservations WHERE state != 'released'")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| PortError::Database(e.to_string()))?;
-
-        let assigned_set: std::collections::HashSet<u16> =
-            rows.iter().map(|r| r.0 as u16).collect();
-
+        // If preferred port given, try it first
         if let Some(preferred_port) = preferred {
-            if !assigned_set.contains(&preferred_port) && self.can_bind(preferred_port) {
+            let is_taken = self.is_port_assigned(preferred_port).await?;
+            if !is_taken && self.can_bind(preferred_port) {
                 return Ok(preferred_port);
             }
 
             if exact_only {
-                if assigned_set.contains(&preferred_port) {
+                if is_taken {
                     let owner: Option<(String,)> = sqlx::query_as(
                         "SELECT owner FROM reservations WHERE assigned_port = ? AND state != 'released'",
                     )
@@ -471,28 +467,61 @@ impl Broker {
                 }
                 return Err(PortError::ExactPortUnavailable(preferred_port));
             }
+        }
 
-            // Fallback: scan upward from preferred, then wrap
-            for port in preferred_port..=end {
-                if !assigned_set.contains(&port) && self.can_bind(port) {
-                    return Ok(port);
-                }
-            }
-            for port in start..preferred_port {
-                if !assigned_set.contains(&port) && self.can_bind(port) {
-                    return Ok(port);
-                }
-            }
-        } else {
-            // No preference: allocate lowest available in range
-            for port in start..=end {
-                if !assigned_set.contains(&port) && self.can_bind(port) {
-                    return Ok(port);
-                }
+        // Determine scan start: start_port > preferred_port > range_start
+        let scan_start = start_port.or(preferred).unwrap_or(range_start);
+
+        // Scan from scan_start to range_end
+        if let Some(port) = self.scan_range(scan_start, range_end).await? {
+            return Ok(port);
+        }
+
+        // Wrap around: scan from range_start to scan_start
+        if scan_start > range_start {
+            if let Some(port) = self.scan_range(range_start, scan_start - 1).await? {
+                return Ok(port);
             }
         }
 
-        Err(PortError::PortRangeExhausted(start, end))
+        Err(PortError::PortRangeExhausted(range_start, range_end))
+    }
+
+    /// Scan a port range [from, to] for the first available port.
+    /// Uses a range-scoped query to only load reservations within the scan window.
+    async fn scan_range(&self, from: u16, to: u16) -> Result<Option<u16>, PortError> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT assigned_port FROM reservations \
+             WHERE assigned_port >= ? AND assigned_port <= ? AND state != 'released'",
+        )
+        .bind(from as i64)
+        .bind(to as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| PortError::Database(e.to_string()))?;
+
+        let taken: std::collections::HashSet<u16> = rows.iter().map(|r| r.0 as u16).collect();
+
+        for port in from..=to {
+            if !taken.contains(&port) && self.can_bind(port) {
+                return Ok(Some(port));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Check if a port is currently assigned (non-released reservation exists).
+    async fn is_port_assigned(&self, port: u16) -> Result<bool, PortError> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT assigned_port FROM reservations WHERE assigned_port = ? AND state != 'released'",
+        )
+        .bind(port as i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| PortError::Database(e.to_string()))?;
+
+        Ok(row.is_some())
     }
 
     /// Check if a port can be bound (not in use by another process).
@@ -541,7 +570,7 @@ mod tests {
         let (mut broker, _dir) = setup_broker().await;
 
         let r = broker
-            .reserve("host:web", None, "127.0.0.1", 8080, None, false)
+            .reserve("host:web", None, "127.0.0.1", 8080, None, false, None)
             .await
             .unwrap();
 
@@ -559,7 +588,7 @@ mod tests {
         let (mut broker, _dir) = setup_broker().await;
 
         let r1 = broker
-            .reserve("host:web", Some(12345), "127.0.0.1", 8080, None, true)
+            .reserve("host:web", Some(12345), "127.0.0.1", 8080, None, true, None)
             .await
             .unwrap();
         assert_eq!(r1.assigned_port, 12345);
@@ -569,7 +598,7 @@ mod tests {
         // Reserve the same preferred port again — this previously failed with a
         // UNIQUE constraint violation on assigned_port before the bug fix.
         let r2 = broker
-            .reserve("host:web2", Some(12345), "127.0.0.1", 9090, None, true)
+            .reserve("host:web2", Some(12345), "127.0.0.1", 9090, None, true, None)
             .await
             .unwrap();
         assert_eq!(r2.assigned_port, 12345);
@@ -581,11 +610,11 @@ mod tests {
         let (mut broker, _dir) = setup_broker().await;
 
         let r1 = broker
-            .reserve("host:web", None, "127.0.0.1", 8080, None, false)
+            .reserve("host:web", None, "127.0.0.1", 8080, None, false, None)
             .await
             .unwrap();
         let r2 = broker
-            .reserve("host:web", None, "127.0.0.1", 8080, None, false)
+            .reserve("host:web", None, "127.0.0.1", 8080, None, false, None)
             .await
             .unwrap();
 
@@ -597,13 +626,13 @@ mod tests {
         let (mut broker, _dir) = setup_broker().await;
 
         let r1 = broker
-            .reserve("host:a", Some(12346), "127.0.0.1", 8080, None, false)
+            .reserve("host:a", Some(12346), "127.0.0.1", 8080, None, false, None)
             .await
             .unwrap();
         assert_eq!(r1.assigned_port, 12346);
 
         let r2 = broker
-            .reserve("host:b", Some(12346), "127.0.0.1", 9090, None, false)
+            .reserve("host:b", Some(12346), "127.0.0.1", 9090, None, false, None)
             .await
             .unwrap();
         assert_ne!(r2.assigned_port, 12346);
@@ -614,12 +643,12 @@ mod tests {
         let (mut broker, _dir) = setup_broker().await;
 
         broker
-            .reserve("host:a", Some(12347), "127.0.0.1", 8080, None, true)
+            .reserve("host:a", Some(12347), "127.0.0.1", 8080, None, true, None)
             .await
             .unwrap();
 
         let result = broker
-            .reserve("host:b", Some(12347), "127.0.0.1", 9090, None, true)
+            .reserve("host:b", Some(12347), "127.0.0.1", 9090, None, true, None)
             .await;
 
         assert!(result.is_err());
@@ -634,15 +663,15 @@ mod tests {
         let (mut broker, _dir) = setup_broker().await;
 
         let r1 = broker
-            .reserve("host:a", None, "127.0.0.1", 8001, None, false)
+            .reserve("host:a", None, "127.0.0.1", 8001, None, false, None)
             .await
             .unwrap();
         broker
-            .reserve("host:b", None, "127.0.0.1", 8002, None, false)
+            .reserve("host:b", None, "127.0.0.1", 8002, None, false, None)
             .await
             .unwrap();
         broker
-            .reserve("vm:c:web", None, "127.0.0.1", 8003, None, false)
+            .reserve("vm:c:web", None, "127.0.0.1", 8003, None, false, None)
             .await
             .unwrap();
 
@@ -669,7 +698,7 @@ mod tests {
         let (mut broker, _dir) = setup_broker().await;
 
         let r = broker
-            .reserve("vm:test:web", None, "127.0.0.1", 8080, None, false)
+            .reserve("vm:test:web", None, "127.0.0.1", 8080, None, false, None)
             .await
             .unwrap();
 
@@ -681,7 +710,7 @@ mod tests {
         let (mut broker, _dir) = setup_broker().await;
 
         let r = broker
-            .reserve("vm:test:web", None, "127.0.0.1", 8080, None, false)
+            .reserve("vm:test:web", None, "127.0.0.1", 8080, None, false, None)
             .await
             .unwrap();
         assert_eq!(r.state, "pending");
@@ -700,7 +729,7 @@ mod tests {
         let (mut broker, _dir) = setup_broker().await;
 
         let r = broker
-            .reserve("host:exp", Some(12348), "127.0.0.1", 8080, Some(1), true)
+            .reserve("host:exp", Some(12348), "127.0.0.1", 8080, Some(1), true, None)
             .await
             .unwrap();
         assert_eq!(r.state, "active");
@@ -734,7 +763,7 @@ mod tests {
         let pool = broker.pool().clone();
 
         let r1 = broker
-            .reserve("host:exp2", Some(12350), "127.0.0.1", 8080, Some(1), true)
+            .reserve("host:exp2", Some(12350), "127.0.0.1", 8080, Some(1), true, None)
             .await
             .unwrap();
         assert_eq!(r1.assigned_port, 12350);
@@ -757,7 +786,7 @@ mod tests {
         broker.release_hold_listener(12350);
 
         let r2 = broker
-            .reserve("host:exp2b", Some(12350), "127.0.0.1", 9090, None, true)
+            .reserve("host:exp2b", Some(12350), "127.0.0.1", 9090, None, true, None)
             .await
             .unwrap();
         assert_eq!(r2.assigned_port, 12350);
@@ -769,7 +798,7 @@ mod tests {
         let (mut broker, _dir) = setup_broker().await;
 
         let r = broker
-            .reserve("host:purge", Some(12351), "127.0.0.1", 8080, None, true)
+            .reserve("host:purge", Some(12351), "127.0.0.1", 8080, None, true, None)
             .await
             .unwrap();
         broker.release_by_id(&r.id).await.unwrap();
@@ -810,7 +839,7 @@ mod tests {
         let mut rx = broker.subscribe();
 
         let r = broker
-            .reserve("host:evt", Some(12352), "127.0.0.1", 8080, None, true)
+            .reserve("host:evt", Some(12352), "127.0.0.1", 8080, None, true, None)
             .await
             .unwrap();
 
@@ -832,7 +861,7 @@ mod tests {
         let (mut broker, _dir) = setup_broker().await;
 
         let r = broker
-            .reserve("vm:evt2:web", Some(12353), "127.0.0.1", 8080, None, true)
+            .reserve("vm:evt2:web", Some(12353), "127.0.0.1", 8080, None, true, None)
             .await
             .unwrap();
         assert_eq!(r.state, "pending");
@@ -855,7 +884,7 @@ mod tests {
         let (mut broker, _dir) = setup_broker().await;
 
         let r = broker
-            .reserve("host:idem", Some(12354), "127.0.0.1", 8080, None, true)
+            .reserve("host:idem", Some(12354), "127.0.0.1", 8080, None, true, None)
             .await
             .unwrap();
 
@@ -873,7 +902,7 @@ mod tests {
         let pool = broker.pool().clone();
 
         let r1 = broker
-            .reserve("host:del1", Some(12349), "127.0.0.1", 8080, None, true)
+            .reserve("host:del1", Some(12349), "127.0.0.1", 8080, None, true, None)
             .await
             .unwrap();
         assert_eq!(r1.assigned_port, 12349);
@@ -891,7 +920,7 @@ mod tests {
 
         // Reserve the same port with a different owner
         let r2 = broker
-            .reserve("host:del2", Some(12349), "127.0.0.1", 9090, None, true)
+            .reserve("host:del2", Some(12349), "127.0.0.1", 9090, None, true, None)
             .await
             .unwrap();
         assert_eq!(r2.assigned_port, 12349);
@@ -905,5 +934,134 @@ mod tests {
                 .await
                 .unwrap();
         assert!(old_row.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_start_port_scans_from_offset() {
+        let (mut broker, _dir) = setup_broker().await;
+
+        // Reserve with start_port=12370 — should get 12370 (first available from that offset)
+        let r = broker
+            .reserve("host:sp1", None, "127.0.0.1", 8080, None, false, Some(12370))
+            .await
+            .unwrap();
+        assert_eq!(r.assigned_port, 12370);
+    }
+
+    #[tokio::test]
+    async fn test_start_port_skips_taken_ports() {
+        let (mut broker, _dir) = setup_broker().await;
+
+        // Take port 12371
+        broker
+            .reserve("host:a", Some(12371), "127.0.0.1", 8001, None, true, None)
+            .await
+            .unwrap();
+
+        // start_port=12371 should skip to 12372
+        let r = broker
+            .reserve("host:b", None, "127.0.0.1", 8002, None, false, Some(12371))
+            .await
+            .unwrap();
+        assert_eq!(r.assigned_port, 12372);
+    }
+
+    #[tokio::test]
+    async fn test_start_port_with_preferred_port() {
+        let (mut broker, _dir) = setup_broker().await;
+
+        // Take port 12373
+        broker
+            .reserve("host:a", Some(12373), "127.0.0.1", 8001, None, true, None)
+            .await
+            .unwrap();
+
+        // preferred_port=12373 (taken) + start_port=12360 — should scan from 12360
+        let r = broker
+            .reserve("host:b", Some(12373), "127.0.0.1", 8002, None, false, Some(12360))
+            .await
+            .unwrap();
+        // start_port takes priority for scan start; 12360 is free
+        assert_eq!(r.assigned_port, 12360);
+    }
+
+    #[tokio::test]
+    async fn test_start_port_wrap_around() {
+        // Use a narrow range with high port numbers to avoid conflicts with other tests
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+        let options = sqlx::sqlite::SqliteConnectOptions::from_str(&db_url)
+            .unwrap()
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .create_if_missing(true);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+
+        // Range 12380-12384 (5 ports)
+        let mut broker = Broker::new(pool, 12380, 12384, 100);
+
+        // Take 12383 and 12384
+        broker
+            .reserve("host:a", Some(12383), "127.0.0.1", 8001, None, true, None)
+            .await
+            .unwrap();
+        broker
+            .reserve("host:b", Some(12384), "127.0.0.1", 8002, None, true, None)
+            .await
+            .unwrap();
+
+        // start_port=12383 — 12383 and 12384 taken, should wrap to 12380
+        let r = broker
+            .reserve("host:c", None, "127.0.0.1", 8003, None, false, Some(12383))
+            .await
+            .unwrap();
+        assert_eq!(r.assigned_port, 12380);
+    }
+
+    #[tokio::test]
+    async fn test_start_port_range_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+        let options = sqlx::sqlite::SqliteConnectOptions::from_str(&db_url)
+            .unwrap()
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .create_if_missing(true);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+
+        // Range 12390-12391 (2 ports)
+        let mut broker = Broker::new(pool, 12390, 12391, 100);
+
+        broker
+            .reserve("host:a", Some(12390), "127.0.0.1", 8001, None, true, None)
+            .await
+            .unwrap();
+        broker
+            .reserve("host:b", Some(12391), "127.0.0.1", 8002, None, true, None)
+            .await
+            .unwrap();
+
+        // All ports taken — should return PortRangeExhausted
+        let result = broker
+            .reserve("host:c", None, "127.0.0.1", 8003, None, false, Some(12390))
+            .await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PortError::PortRangeExhausted(start, end) => {
+                assert_eq!(start, 12390);
+                assert_eq!(end, 12391);
+            }
+            other => panic!("expected PortRangeExhausted, got: {:?}", other),
+        }
     }
 }
