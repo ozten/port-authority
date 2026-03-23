@@ -21,3 +21,4 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-stream = "0.1"

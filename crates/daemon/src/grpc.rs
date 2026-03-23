@@ -18,6 +18,30 @@ use tonic::transport::server::Connected;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
+fn validate_owner(owner: &str) -> Result<(), Status> {
+    if owner.is_empty() || owner.len() > 128 {
+        return Err(Status::invalid_argument("owner must be 1-128 characters"));
+    }
+    if !owner
+        .chars()
+        .all(|c| c.is_alphanumeric() || ":-_.".contains(c))
+    {
+        return Err(Status::invalid_argument(
+            "owner contains invalid characters",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_target_host(host: &str) -> Result<(), Status> {
+    if host.is_empty() || host.len() > 253 {
+        return Err(Status::invalid_argument(
+            "target_host must be 1-253 characters",
+        ));
+    }
+    Ok(())
+}
+
 pub struct PortBrokerService {
     broker: Arc<Mutex<Broker>>,
     tunnel_manager: Arc<Mutex<TunnelManager>>,
@@ -116,6 +140,18 @@ impl PortBroker for PortBrokerService {
         request: Request<ReserveRequest>,
     ) -> Result<Response<ReserveResponse>, Status> {
         let req = request.into_inner();
+
+        validate_owner(&req.owner)?;
+        validate_target_host(&req.target_host)?;
+        if req.target_port == 0 || req.target_port > 65535 {
+            return Err(Status::invalid_argument("target_port must be 1-65535"));
+        }
+        if let Some(port) = req.preferred_port {
+            if port == 0 || port > 65535 {
+                return Err(Status::invalid_argument("preferred_port must be 1-65535"));
+            }
+        }
+
         let mut broker = self.broker.lock().await;
 
         let reservation = broker
@@ -245,6 +281,11 @@ impl PortBroker for PortBrokerService {
 
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         let req = request.into_inner();
+
+        if let Some(ref owner) = req.owner_filter {
+            validate_owner(owner)?;
+        }
+
         let broker = self.broker.lock().await;
 
         let state_filter = req
@@ -332,9 +373,71 @@ impl PortBroker for PortBrokerService {
 
     async fn watch(
         &self,
-        _request: Request<WatchRequest>,
+        request: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
-        Err(Status::unimplemented("watch not yet implemented (Phase 2)"))
+        let req = request.into_inner();
+        let owner_filter = req.owner_filter;
+
+        // Subscribe to broker events
+        let mut event_rx = {
+            let broker = self.broker.lock().await;
+            broker.subscribe()
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+        tokio::spawn(async move {
+            loop {
+                match event_rx.recv().await {
+                    Ok(event) => {
+                        // Apply owner filter if specified
+                        if let Some(ref filter) = owner_filter {
+                            if !event.owner.starts_with(filter.as_str()) {
+                                continue;
+                            }
+                        }
+
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default();
+
+                        let old_state = ReservationState::from_sql(&event.old_state)
+                            .map(|s| s.to_proto())
+                            .unwrap_or(0);
+                        let new_state = ReservationState::from_sql(&event.new_state)
+                            .map(|s| s.to_proto())
+                            .unwrap_or(0);
+
+                        let proto_event = ReservationEvent {
+                            reservation_id: event.reservation_id,
+                            old_state,
+                            new_state,
+                            timestamp: Some(Timestamp {
+                                seconds: now.as_secs() as i64,
+                                nanos: 0,
+                            }),
+                            message: event.message,
+                        };
+
+                        if tx.send(Ok(proto_event)).await.is_err() {
+                            // Client disconnected
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(skipped = n, "watch stream lagged, some events were dropped");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 }
 

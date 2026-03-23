@@ -50,6 +50,12 @@ async fn main() -> anyhow::Result<()> {
     let lease_cleanup = lease::LeaseCleanup::new(pool, config.lease);
     let lease_handle = tokio::spawn(lease_cleanup.run(expired_tx, shutdown_rx.clone()));
 
+    // Get a clone of the event sender for lease expiry events
+    let event_tx = {
+        let b = broker.lock().await;
+        b.event_sender()
+    };
+
     // Expired-reservation tunnel teardown task
     let tunnel_mgr_for_expired = Arc::clone(&tunnel_manager);
     let broker_for_expired = Arc::clone(&broker);
@@ -61,6 +67,16 @@ async fn main() -> anyhow::Result<()> {
                 // Also free hold listener in broker
                 let mut b = broker_for_expired.lock().await;
                 b.release_hold_listener(expired.assigned_port);
+                drop(b);
+
+                // Emit a broker event for the lease expiry
+                let _ = event_tx.send(broker::BrokerEvent {
+                    reservation_id: expired.id,
+                    owner: String::new(),
+                    old_state: "active".to_string(),
+                    new_state: "released".to_string(),
+                    message: Some("lease expired".to_string()),
+                });
             }
         }
     });
@@ -134,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(unix)]
 fn set_socket_permissions(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(0o660);
+    let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(path, perms)
         .with_context(|| format!("failed to set socket permissions: {}", path.display()))?;
     Ok(())

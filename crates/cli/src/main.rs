@@ -5,7 +5,8 @@ use clap::{Parser, Subcommand};
 use hyper_util::rt::TokioIo;
 use port_authority_core::proto::port_broker_client::PortBrokerClient;
 use port_authority_core::proto::{
-    InspectRequest, ListRequest, ReleaseRequest, ReserveRequest, inspect_request, release_request,
+    InspectRequest, ListRequest, ReleaseRequest, ReserveRequest, WatchRequest, inspect_request,
+    release_request,
 };
 use std::path::PathBuf;
 use tonic::transport::{Channel, Endpoint, Uri};
@@ -78,6 +79,13 @@ enum Commands {
         /// Inspect by reservation ID
         #[arg(short, long)]
         id: Option<String>,
+    },
+
+    /// Watch reservation state changes in real-time
+    Watch {
+        /// Filter by owner prefix
+        #[arg(short, long)]
+        owner: Option<String>,
     },
 
     /// Show daemon health and statistics
@@ -193,6 +201,33 @@ async fn main() -> anyhow::Result<()> {
                 output::print_json(&resp)?;
             } else {
                 output::print_inspect(&resp);
+            }
+        }
+
+        Commands::Watch { owner } => {
+            let mut stream = client
+                .watch(WatchRequest {
+                    owner_filter: owner,
+                })
+                .await
+                .context("watch failed")?
+                .into_inner();
+
+            use tokio_stream::StreamExt;
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(ev) => {
+                        if cli.json {
+                            output::print_watch_event_json(&ev);
+                        } else {
+                            output::print_watch_event(&ev);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("stream error: {}", e);
+                        break;
+                    }
+                }
             }
         }
 

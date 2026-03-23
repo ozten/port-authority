@@ -3,7 +3,18 @@ use port_authority_core::types::ReservationState;
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use std::net::TcpListener as StdTcpListener;
+use tokio::sync::broadcast;
 use tracing::{debug, info};
+
+/// An internal event emitted by the Broker when reservation state changes.
+#[derive(Debug, Clone)]
+pub struct BrokerEvent {
+    pub reservation_id: String,
+    pub owner: String,
+    pub old_state: String,
+    pub new_state: String,
+    pub message: Option<String>,
+}
 use uuid::Uuid;
 
 /// A reservation record as stored in the database.
@@ -45,6 +56,13 @@ impl Reservation {
 const SELECT_COLS: &str = "id, owner, requested_port, assigned_port, target_host, target_port, \
      state, lease_seconds, expires_at, created_at, updated_at, reconnect_count";
 
+/// Escape special LIKE pattern characters so they match literally.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 /// The port broker — manages reservations and port allocation.
 /// All methods are &mut self; external synchronization is via tokio::sync::Mutex.
 pub struct Broker {
@@ -52,15 +70,34 @@ pub struct Broker {
     port_range: (u16, u16),
     /// Hold listeners for ports that are reserved but not yet tunneled.
     hold_listeners: HashMap<u16, StdTcpListener>,
+    /// Broadcast channel for reservation state change events.
+    event_tx: broadcast::Sender<BrokerEvent>,
 }
 
 impl Broker {
     pub fn new(pool: SqlitePool, port_range_start: u16, port_range_end: u16) -> Self {
+        let (event_tx, _) = broadcast::channel(256);
         Self {
             pool,
             port_range: (port_range_start, port_range_end),
             hold_listeners: HashMap::new(),
+            event_tx,
         }
+    }
+
+    /// Subscribe to reservation state change events.
+    pub fn subscribe(&self) -> broadcast::Receiver<BrokerEvent> {
+        self.event_tx.subscribe()
+    }
+
+    /// Emit a broker event. Failures (no receivers) are silently ignored.
+    fn emit_event(&self, event: BrokerEvent) {
+        let _ = self.event_tx.send(event);
+    }
+
+    /// Get a clone of the event sender (for external emission, e.g. lease expiry).
+    pub fn event_sender(&self) -> broadcast::Sender<BrokerEvent> {
+        self.event_tx.clone()
     }
 
     /// Reserve a port. Returns the reservation record.
@@ -174,6 +211,14 @@ impl Broker {
 
         info!(id = %id, port = port, owner = owner, state = %state_str, "port reserved");
 
+        self.emit_event(BrokerEvent {
+            reservation_id: id.clone(),
+            owner: owner.to_string(),
+            old_state: "unspecified".to_string(),
+            new_state: state_str.to_string(),
+            message: Some("new reservation".to_string()),
+        });
+
         // Fetch and return the full record
         self.get_reservation_by_id(&id).await
     }
@@ -184,12 +229,32 @@ impl Broker {
         reservation_id: &str,
         new_state: ReservationState,
     ) -> Result<(), PortError> {
+        // Fetch old state and owner for event emission
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT state, owner FROM reservations WHERE id = ?")
+                .bind(reservation_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| PortError::Database(e.to_string()))?;
+
+        let (old_state, owner) =
+            row.ok_or_else(|| PortError::ReservationNotFound(reservation_id.to_string()))?;
+
         sqlx::query("UPDATE reservations SET state = ? WHERE id = ?")
             .bind(new_state.as_sql())
             .bind(reservation_id)
             .execute(&self.pool)
             .await
             .map_err(|e| PortError::Database(e.to_string()))?;
+
+        self.emit_event(BrokerEvent {
+            reservation_id: reservation_id.to_string(),
+            owner,
+            old_state,
+            new_state: new_state.as_sql().to_string(),
+            message: None,
+        });
+
         Ok(())
     }
 
@@ -224,6 +289,15 @@ impl Broker {
         self.hold_listeners.remove(&port);
 
         info!(id = %reservation.id, port = port, "reservation released");
+
+        self.emit_event(BrokerEvent {
+            reservation_id: reservation.id.clone(),
+            owner: reservation.owner.clone(),
+            old_state: reservation.state.clone(),
+            new_state: "released".to_string(),
+            message: None,
+        });
+
         Ok(())
     }
 
@@ -235,9 +309,9 @@ impl Broker {
     ) -> Result<Vec<Reservation>, PortError> {
         let rows = match (owner_filter, state_filter) {
             (Some(owner), Some(state)) => {
-                let pattern = format!("{}%", owner);
+                let pattern = format!("{}%", escape_like(owner));
                 sqlx::query(&format!(
-                    "SELECT {} FROM reservations WHERE owner LIKE ? AND state = ? ORDER BY assigned_port",
+                    "SELECT {} FROM reservations WHERE owner LIKE ? ESCAPE '\\' AND state = ? ORDER BY assigned_port",
                     SELECT_COLS
                 ))
                 .bind(pattern)
@@ -246,9 +320,9 @@ impl Broker {
                 .await
             }
             (Some(owner), None) => {
-                let pattern = format!("{}%", owner);
+                let pattern = format!("{}%", escape_like(owner));
                 sqlx::query(&format!(
-                    "SELECT {} FROM reservations WHERE owner LIKE ? AND state != 'released' ORDER BY assigned_port",
+                    "SELECT {} FROM reservations WHERE owner LIKE ? ESCAPE '\\' AND state != 'released' ORDER BY assigned_port",
                     SELECT_COLS
                 ))
                 .bind(pattern)
@@ -390,5 +464,195 @@ impl Broker {
     /// Check if a port can be bound (not in use by another process).
     fn can_bind(&self, port: u16) -> bool {
         StdTcpListener::bind(("127.0.0.1", port)).is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    async fn setup_broker() -> (Broker, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+        let options = sqlx::sqlite::SqliteConnectOptions::from_str(&db_url)
+            .unwrap()
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .create_if_missing(true);
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .unwrap();
+
+        let broker = Broker::new(pool, 10000, 60000);
+        (broker, dir)
+    }
+
+    #[tokio::test]
+    async fn test_reserve_and_release_basic() {
+        let (mut broker, _dir) = setup_broker().await;
+
+        let r = broker
+            .reserve("host:web", None, "127.0.0.1", 8080, None, false)
+            .await
+            .unwrap();
+
+        assert_eq!(r.state, "active");
+        assert!((10000..=60000).contains(&(r.assigned_port as u16)));
+
+        broker.release_by_id(&r.id).await.unwrap();
+
+        let released = broker.get_reservation_by_id(&r.id).await.unwrap();
+        assert_eq!(released.state, "released");
+    }
+
+    #[tokio::test]
+    async fn test_reserve_release_reserve_same_port() {
+        let (mut broker, _dir) = setup_broker().await;
+
+        let r1 = broker
+            .reserve("host:web", Some(12345), "127.0.0.1", 8080, None, true)
+            .await
+            .unwrap();
+        assert_eq!(r1.assigned_port, 12345);
+
+        broker.release_by_id(&r1.id).await.unwrap();
+
+        // Reserve the same preferred port again — this previously failed with a
+        // UNIQUE constraint violation on assigned_port before the bug fix.
+        let r2 = broker
+            .reserve("host:web2", Some(12345), "127.0.0.1", 9090, None, true)
+            .await
+            .unwrap();
+        assert_eq!(r2.assigned_port, 12345);
+        assert_ne!(r2.id, r1.id);
+    }
+
+    #[tokio::test]
+    async fn test_idempotent_reserve() {
+        let (mut broker, _dir) = setup_broker().await;
+
+        let r1 = broker
+            .reserve("host:web", None, "127.0.0.1", 8080, None, false)
+            .await
+            .unwrap();
+        let r2 = broker
+            .reserve("host:web", None, "127.0.0.1", 8080, None, false)
+            .await
+            .unwrap();
+
+        assert_eq!(r1.id, r2.id);
+    }
+
+    #[tokio::test]
+    async fn test_preferred_port_fallback() {
+        let (mut broker, _dir) = setup_broker().await;
+
+        let r1 = broker
+            .reserve("host:a", Some(12346), "127.0.0.1", 8080, None, false)
+            .await
+            .unwrap();
+        assert_eq!(r1.assigned_port, 12346);
+
+        let r2 = broker
+            .reserve("host:b", Some(12346), "127.0.0.1", 9090, None, false)
+            .await
+            .unwrap();
+        assert_ne!(r2.assigned_port, 12346);
+    }
+
+    #[tokio::test]
+    async fn test_exact_port_unavailable() {
+        let (mut broker, _dir) = setup_broker().await;
+
+        broker
+            .reserve("host:a", Some(12347), "127.0.0.1", 8080, None, true)
+            .await
+            .unwrap();
+
+        let result = broker
+            .reserve("host:b", Some(12347), "127.0.0.1", 9090, None, true)
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PortError::PortUnavailable(port, _) => assert_eq!(port, 12347),
+            other => panic!("expected PortUnavailable, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_filters() {
+        let (mut broker, _dir) = setup_broker().await;
+
+        let r1 = broker
+            .reserve("host:a", None, "127.0.0.1", 8001, None, false)
+            .await
+            .unwrap();
+        broker
+            .reserve("host:b", None, "127.0.0.1", 8002, None, false)
+            .await
+            .unwrap();
+        broker
+            .reserve("vm:c:web", None, "127.0.0.1", 8003, None, false)
+            .await
+            .unwrap();
+
+        // No filter — all 3
+        let all = broker.list(None, None).await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        // owner_filter="host" — 2 results
+        let hosts = broker.list(Some("host"), None).await.unwrap();
+        assert_eq!(hosts.len(), 2);
+
+        // owner_filter="vm" — 1 result
+        let vms = broker.list(Some("vm"), None).await.unwrap();
+        assert_eq!(vms.len(), 1);
+
+        // Release one, default list excludes released
+        broker.release_by_id(&r1.id).await.unwrap();
+        let after_release = broker.list(None, None).await.unwrap();
+        assert_eq!(after_release.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_vm_reservation_starts_pending() {
+        let (mut broker, _dir) = setup_broker().await;
+
+        let r = broker
+            .reserve("vm:test:web", None, "127.0.0.1", 8080, None, false)
+            .await
+            .unwrap();
+
+        assert_eq!(r.state, "pending");
+    }
+
+    #[tokio::test]
+    async fn test_update_state() {
+        let (mut broker, _dir) = setup_broker().await;
+
+        let r = broker
+            .reserve("vm:test:web", None, "127.0.0.1", 8080, None, false)
+            .await
+            .unwrap();
+        assert_eq!(r.state, "pending");
+
+        broker
+            .update_state(&r.id, ReservationState::Active)
+            .await
+            .unwrap();
+
+        let updated = broker.get_reservation_by_id(&r.id).await.unwrap();
+        assert_eq!(updated.state, "active");
     }
 }
