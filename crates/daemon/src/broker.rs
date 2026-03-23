@@ -122,6 +122,14 @@ impl Broker {
             .await
             .map_err(|e| PortError::Database(e.to_string()))?;
 
+        // Clear any released row holding this port to avoid UNIQUE constraint violation.
+        // Released rows are dead data — purge_released() would eventually delete them anyway.
+        sqlx::query("DELETE FROM reservations WHERE assigned_port = ? AND state = 'released'")
+            .bind(port as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| PortError::Database(e.to_string()))?;
+
         if let Some(lease_secs) = lease_seconds.filter(|&s| s > 0) {
             sqlx::query(
                 "INSERT INTO reservations (id, owner, requested_port, assigned_port, target_host, target_port, state, lease_seconds, expires_at) \

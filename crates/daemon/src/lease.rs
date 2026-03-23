@@ -86,27 +86,17 @@ impl LeaseCleanup {
     }
 
     async fn expire_leases(&self) -> Result<Vec<ExpiredReservation>, sqlx::Error> {
-        // SELECT first, then UPDATE — SQLite may not support RETURNING on older versions.
+        // Atomic UPDATE+RETURNING — prevents race with Broker operations.
+        // The old SELECT-then-UPDATE allowed the Broker to interleave between them,
+        // potentially destroying a new reservation's hold listener.
         let rows = sqlx::query_as::<_, (String, i64)>(
-            "SELECT id, assigned_port FROM reservations \
-             WHERE state IN ('active', 'pending') \
-             AND expires_at IS NOT NULL \
-             AND expires_at <= datetime('now')",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        sqlx::query(
             "UPDATE reservations SET state = 'released' \
              WHERE state IN ('active', 'pending') \
              AND expires_at IS NOT NULL \
-             AND expires_at <= datetime('now')",
+             AND expires_at <= datetime('now') \
+             RETURNING id, assigned_port",
         )
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
 
         let expired: Vec<ExpiredReservation> = rows

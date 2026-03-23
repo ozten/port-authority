@@ -19,7 +19,7 @@ thiserror = "2"
 tonic = "0.12"
 prost = "0.13"
 prost-types = "0.13"
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
 clap = { version = "4", features = ["derive"] }
 russh = "0.46"
 russh-keys = "0.46"

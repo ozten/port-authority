@@ -21,23 +21,22 @@ pub async fn init_pool(db_path: &Path) -> anyhow::Result<SqlitePool> {
         .foreign_keys(true);
 
     let pool = SqlitePoolOptions::new()
-        .max_connections(1) // Single-writer for SQLite
+        // Single-writer — REQUIRED for correctness, not just performance.
+        // Broker and LeaseCleanup share this pool without application-level
+        // locking across their operations. Increasing max_connections breaks
+        // transaction isolation assumptions between these two actors.
+        .max_connections(1)
         .connect_with(options)
         .await
         .with_context(|| format!("failed to open database: {}", db_path.display()))?;
 
-    // Run migrations
-    run_migrations(&pool).await?;
+    // Run migrations — sqlx tracks applied versions in _sqlx_migrations,
+    // checksums each file, and wraps each migration in a transaction.
+    sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .context("failed to run migrations")?;
 
     info!(path = %db_path.display(), "database initialized");
     Ok(pool)
-}
-
-async fn run_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
-    let migration_sql = include_str!("../../../migrations/001_initial.sql");
-    sqlx::raw_sql(migration_sql)
-        .execute(pool)
-        .await
-        .context("failed to run migrations")?;
-    Ok(())
 }
