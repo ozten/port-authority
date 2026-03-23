@@ -20,7 +20,7 @@ struct Cli {
     socket: String,
 
     /// Output as JSON (for scripting)
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     json: bool,
 
     #[command(subcommand)]
