@@ -1,4 +1,6 @@
 import { createChannel, createClient, type Channel, type Client } from 'nice-grpc';
+import { homedir } from 'os';
+import { join } from 'path';
 import { PortBrokerDefinition } from './generated/portd.js';
 
 type PortBrokerClient = Client<typeof PortBrokerDefinition>;
@@ -10,12 +12,24 @@ interface GrpcSingleton {
 	client: PortBrokerClient;
 }
 
+function resolveSocketPath(): string {
+	// Explicit override via env var
+	if (process.env.PORTD_SOCKET) return process.env.PORTD_SOCKET;
+
+	// Match the daemon's default_socket_path logic:
+	// 1. $XDG_RUNTIME_DIR/portd.sock (Linux)
+	// 2. ~/.local/share/portd/portd.sock (macOS fallback)
+	if (process.env.XDG_RUNTIME_DIR) {
+		return join(process.env.XDG_RUNTIME_DIR, 'portd.sock');
+	}
+	return join(homedir(), '.local', 'share', 'portd', 'portd.sock');
+}
+
 function getGrpc(): GrpcSingleton {
 	const existing = (globalThis as Record<symbol, GrpcSingleton | undefined>)[GRPC_KEY];
 	if (existing) return existing;
 
-	const runtimeDir = process.env.XDG_RUNTIME_DIR || '/run/user/1000';
-	const socketPath = process.env.PORTD_SOCKET || `${runtimeDir}/portd.sock`;
+	const socketPath = resolveSocketPath();
 	const address = `unix:${socketPath}`;
 
 	const channel = createChannel(address);
